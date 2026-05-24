@@ -28,10 +28,17 @@ from typing import Optional
 
 from .a3m import SEQ_ALPHABET_SIZE
 from .initialization import init_gate_linear, init_linear
+from .residue_constants import NUM_DNA_TOKENS
 from .utils import dropout_columnwise, dropout_rowwise
 
 
+# Protein-only target feature dim: one-hot over 21 protein tokens + 1 extra channel.
 TARGET_FEAT_DIM = SEQ_ALPHABET_SIZE + 1
+
+# Joint protein+DNA vocabulary.
+# Protein tokens: 0–20 (20 AA + UNK).  DNA tokens: 21–25 (a/c/g/t + DUNK).
+JOINT_TOKEN_SIZE = SEQ_ALPHABET_SIZE + NUM_DNA_TOKENS   # 26
+JOINT_FEAT_DIM   = JOINT_TOKEN_SIZE + 1                 # 27 (one-hot + 1 extra channel)
 
 class InputEmbedder(torch.nn.Module):
     """Initial MSA + pair embedding (Algorithm 3).
@@ -92,6 +99,114 @@ class InputEmbedder(torch.nn.Module):
         m = self.linear_target_feat_3(target_feat).unsqueeze(1) + self.linear_msa(msa_feat)
 
         return m, z
+
+class ChainTypeEmbedder(torch.nn.Module):
+    """Chain-type embedding added to the pair representation z_ij.
+
+    Each token carries a chain-type label: 0 = protein residue, 1 = DNA
+    nucleotide. For every pair (i, j) the contribution is:
+
+        z_ij += embed(type_i) + embed(type_j)
+
+    This gives the Evoformer four distinguishable pair contexts without
+    any extra architecture: protein–protein (0+0), protein–DNA (0+1),
+    DNA–protein (1+0), and DNA–DNA (1+1). Because embed(0)+embed(1) and
+    embed(1)+embed(0) are identical, the embedding is symmetric, which is
+    the correct inductive bias (a protein residue interacting with a DNA
+    nucleotide is the same regardless of which chain we call "i").
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        # 2 chain types: 0=protein, 1=DNA.
+        self.embed = torch.nn.Embedding(2, config.c_z)
+        torch.nn.init.normal_(self.embed.weight, std=0.02)
+
+    def forward(self, chain_type: torch.Tensor) -> torch.Tensor:
+        # chain_type: (batch, N_total), values in {0, 1}
+        e = self.embed(chain_type)          # (batch, N_total, c_z)
+        return e.unsqueeze(2) + e.unsqueeze(1)   # (batch, N_total, N_total, c_z)
+
+
+class JointInputEmbedder(torch.nn.Module):
+    """Input embedder for protein-DNA complexes (extends Algorithm 3).
+
+    Identical to :class:`InputEmbedder` except:
+
+    1. **Extended token vocabulary.** ``target_feat`` is one-hot over the
+       joint 26-token alphabet (21 protein + 5 DNA), giving
+       ``JOINT_FEAT_DIM = 27`` input channels instead of 22.
+
+    2. **Chain-type embedding.** A learned 2-token embedding for
+       protein (0) vs DNA (1) is added to ``z_ij`` as
+       ``embed(type_i) + embed(type_j)``, giving the Evoformer an explicit
+       signal about which molecule each token belongs to (Algorithm 3
+       supplement note: "any additional per-residue features can be
+       concatenated or added to the pair representation").
+
+    3. **MSA zero-padding for DNA.** ``msa_feat`` is expected to cover the
+       full concatenated sequence length ``N_total = N_protein + N_dna``
+       with the DNA positions already zero-padded. The caller is
+       responsible for the padding; this module treats all positions
+       uniformly. DNA positions therefore contribute no MSA signal, which
+       is correct — there is no evolutionary MSA for the DNA strand.
+
+    Output shapes are identical to :class:`InputEmbedder`:
+    ``m`` ``(batch, N_cluster, N_total, c_m)``,
+    ``z`` ``(batch, N_total, N_total, c_z)``.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+
+        self.linear_target_feat_1 = torch.nn.Linear(JOINT_FEAT_DIM, config.c_z)
+        self.linear_target_feat_2 = torch.nn.Linear(JOINT_FEAT_DIM, config.c_z)
+        self.linear_target_feat_3 = torch.nn.Linear(JOINT_FEAT_DIM, config.c_m)
+        self.linear_msa           = torch.nn.Linear(49, config.c_m)
+
+        init_linear(self.linear_target_feat_1, init="default")
+        init_linear(self.linear_target_feat_2, init="default")
+        init_linear(self.linear_target_feat_3, init="default")
+        init_linear(self.linear_msa,           init="default")
+
+        self.rel_pos            = RelPos(config)
+        self.chain_type_embedder = ChainTypeEmbedder(config)
+
+    def forward(
+        self,
+        target_feat:   torch.Tensor,
+        residue_index: torch.Tensor,
+        msa_feat:      torch.Tensor,
+        chain_type:    torch.Tensor,
+    ):
+        """
+        Args:
+            target_feat:   (batch, N_total, JOINT_FEAT_DIM=27)
+            residue_index: (batch, N_total)  — contiguous 0..N-1 per chain,
+                           with a gap ≥ 200 between the protein and DNA chains
+                           so RelPos treats them as far apart.
+            msa_feat:      (batch, N_cluster, N_total, 49)  — DNA positions
+                           should be zero-padded by the caller.
+            chain_type:    (batch, N_total)  — 0=protein, 1=DNA.
+        """
+        assert target_feat.shape[-1] == JOINT_FEAT_DIM, (
+            f"target_feat last dim must be {JOINT_FEAT_DIM}, got {target_feat.shape[-1]}"
+        )
+
+        a = self.linear_target_feat_1(target_feat)   # (batch, N_total, c_z)
+        b = self.linear_target_feat_2(target_feat)
+
+        z = a.unsqueeze(2) + b.unsqueeze(1)          # (batch, N_total, N_total, c_z)
+        z = z + self.rel_pos(residue_index)
+        z = z + self.chain_type_embedder(chain_type)
+
+        m = (
+            self.linear_target_feat_3(target_feat).unsqueeze(1)  # (batch, 1, N_total, c_m)
+            + self.linear_msa(msa_feat)                           # (batch, N_cluster, N_total, c_m)
+        )
+
+        return m, z
+
 
 class RelPos(torch.nn.Module):
     """Relative-position encoding (Algorithm 4).
