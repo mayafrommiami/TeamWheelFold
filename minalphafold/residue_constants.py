@@ -829,3 +829,129 @@ def _make_atom14_distance_bounds():
 
 
 _make_atom14_distance_bounds()
+
+
+# ── DNA nucleotide constants ──────────────────────────────────────────────────
+# These extend the protein vocabulary for protein-DNA complex modelling.
+
+# Single-letter codes use lowercase (a/c/g/t) to distinguish from amino acids.
+dna_restypes = ['a', 'c', 'g', 't']
+dna_restype_1to3 = {'a': 'DA', 'c': 'DC', 'g': 'DG', 't': 'DT'}
+dna_restype_3to1 = {v: k for k, v in dna_restype_1to3.items()}
+dna_restype_order = {r: i for i, r in enumerate(dna_restypes)}
+
+# Protein tokens occupy indices 0–20 (20 amino acids + UNK).
+# DNA tokens start immediately after: a=21, c=22, g=23, t=24, DUNK=25.
+NUM_PROTEIN_TOKENS = 21
+DNA_TOKEN_OFFSET = NUM_PROTEIN_TOKENS
+NUM_DNA_TOKENS = 5  # 4 nucleotides + DUNK
+
+# 14-slot heavy-atom representation per nucleotide.
+# Slots 0–10: sugar-phosphate backbone atoms, identical for all four nucleotides.
+# Slots 11–13: nucleotide-specific base atoms used for frame construction
+#              and torsion angle supervision.
+#
+# Frame definition: C4' (origin) → C3' (x-axis) with C1' in the xy-plane.
+# Analogous to the protein backbone frame CA(origin) → C(x-axis) with N in plane.
+DNA_BACKBONE_ATOMS = [
+    "P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'",
+]
+DNA_FRAME_ATOMS = ("C4'", "C3'", "C1'")
+
+dna_restype_name_to_atom14_names = {
+    # Purines (A, G): glycosidic bond at N9–C1'; C8 and N1 anchor the bicyclic ring.
+    'DA':   ["P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'", "N9",  "C8",  "N1" ],
+    'DG':   ["P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'", "N9",  "C8",  "N1" ],
+    # Pyrimidines (C, T): glycosidic bond at N1–C1'; C4 and N3/C6 anchor the ring.
+    'DC':   ["P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'", "N1",  "C4",  "N3" ],
+    'DT':   ["P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'", "N1",  "C4",  "C6" ],
+    # Unknown nucleotide: all slots empty.
+    'DUNK': ['',  '',    '',    '',    '',    '',    '',    '',    '',    '',    '',   '',    '',    ''   ],
+}
+
+# Lookup: residue_name → atom_name → atom14 slot index.
+DNA_ATOM14_INDEX = {
+    res: {atom: idx for idx, atom in enumerate(atoms) if atom}
+    for res, atoms in dna_restype_name_to_atom14_names.items()
+}
+
+# Between-nucleotide O3'(i) → P(i+1) phosphodiester backbone bond.
+# Mean and std from a CSD survey of high-resolution DNA crystal structures.
+between_res_dna_bond_length_o3p = 1.607   # Å mean
+between_res_dna_bond_length_stddev_o3p = 0.020  # Å std
+
+
+def dna_sequence_to_ids(sequence):
+    """Convert a string of lowercase DNA single-letter codes to token IDs.
+
+    Returns indices in [0, NUM_DNA_TOKENS-1] — not offset by DNA_TOKEN_OFFSET.
+    The embedding layer applies the offset when mixing protein and DNA tokens.
+    Unknown characters map to index NUM_DNA_TOKENS-1 (DUNK).
+    """
+    return np.array(
+        [dna_restype_order.get(ch.lower(), NUM_DNA_TOKENS - 1) for ch in sequence],
+        dtype=np.int32,
+    )
+
+
+# ── DNA nucleotide constants ──────────────────────────────────────────────────
+# These extend the protein vocabulary for protein-DNA complex modelling.
+
+# Single-letter codes use lowercase (a/c/g/t) to distinguish from amino acids.
+dna_restypes = ['a', 'c', 'g', 't']
+dna_restype_1to3 = {'a': 'DA', 'c': 'DC', 'g': 'DG', 't': 'DT'}
+dna_restype_3to1 = {v: k for k, v in dna_restype_1to3.items()}
+dna_restype_order = {r: i for i, r in enumerate(dna_restypes)}
+
+# Protein tokens occupy indices 0–20 (20 amino acids + UNK).
+# DNA tokens start immediately after: a=21, c=22, g=23, t=24, DUNK=25.
+NUM_PROTEIN_TOKENS = 21
+DNA_TOKEN_OFFSET = NUM_PROTEIN_TOKENS
+NUM_DNA_TOKENS = 5  # 4 nucleotides + DUNK
+
+# 14-slot heavy-atom representation per nucleotide.
+# Slots 0–10: sugar-phosphate backbone atoms, identical for all four nucleotides.
+# Slots 11–13: nucleotide-specific base atoms used for frame construction
+#              and torsion angle supervision.
+#
+# Frame definition: C4' (origin) → C3' (x-axis) with C1' in the xy-plane.
+# Analogous to the protein backbone frame CA(origin) → C(x-axis) with N in plane.
+DNA_BACKBONE_ATOMS = [
+    "P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'",
+]
+DNA_FRAME_ATOMS = ("C4'", "C3'", "C1'")
+
+dna_restype_name_to_atom14_names = {
+    # Purines (A, G): glycosidic bond at N9–C1'; C8 and N1 anchor the bicyclic ring.
+    'DA':   ["P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'", "N9",  "C8",  "N1" ],
+    'DG':   ["P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'", "N9",  "C8",  "N1" ],
+    # Pyrimidines (C, T): glycosidic bond at N1–C1'; C4 and N3/C6 anchor the ring.
+    'DC':   ["P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'", "N1",  "C4",  "N3" ],
+    'DT':   ["P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'", "N1",  "C4",  "C6" ],
+    # Unknown nucleotide: all slots empty.
+    'DUNK': ['',  '',    '',    '',    '',    '',    '',    '',    '',    '',    '',   '',    '',    ''   ],
+}
+
+# Lookup: residue_name → atom_name → atom14 slot index.
+DNA_ATOM14_INDEX = {
+    res: {atom: idx for idx, atom in enumerate(atoms) if atom}
+    for res, atoms in dna_restype_name_to_atom14_names.items()
+}
+
+# Between-nucleotide O3'(i) → P(i+1) phosphodiester backbone bond.
+# Mean and std from a CSD survey of high-resolution DNA crystal structures.
+between_res_dna_bond_length_o3p = 1.607   # Å mean
+between_res_dna_bond_length_stddev_o3p = 0.020  # Å std
+
+
+def dna_sequence_to_ids(sequence):
+    """Convert a string of lowercase DNA single-letter codes to token IDs.
+
+    Returns indices in [0, NUM_DNA_TOKENS-1] — not offset by DNA_TOKEN_OFFSET.
+    The embedding layer applies the offset when mixing protein and DNA tokens.
+    Unknown characters map to index NUM_DNA_TOKENS-1 (DUNK).
+    """
+    return np.array(
+        [dna_restype_order.get(ch.lower(), NUM_DNA_TOKENS - 1) for ch in sequence],
+        dtype=np.int32,
+    )

@@ -36,7 +36,12 @@ from typing import Dict, Iterable, List, Tuple
 import numpy as np
 
 from .a3m import sequence_to_ids
-from .residue_constants import restype_name_to_atom14_names
+from .residue_constants import (
+    restype_name_to_atom14_names,
+    DNA_ATOM14_INDEX,
+    dna_restype_order,
+    NUM_DNA_TOKENS,
+)
 
 
 THREE_TO_ONE = {
@@ -66,6 +71,47 @@ ATOM14_INDEX = {
     residue_name: {atom_name: atom_idx for atom_idx, atom_name in enumerate(atom_names) if atom_name}
     for residue_name, atom_names in restype_name_to_atom14_names.items()
 }
+
+
+# Residue name → single-letter for DNA chains (atom_site uses DA/DC/DG/DT;
+# some older files use bare A/C/G/T).
+_DNA_RESNAME_TO_1 = {
+    'DA': 'a', 'DC': 'c', 'DG': 'g', 'DT': 't',
+    'A':  'a', 'C':  'c', 'G':  'g', 'T':  't',
+}
+
+
+def _normalize_dna_resname(resname: str) -> str:
+    """Canonicalise a DNA residue name to one of DA/DC/DG/DT/DUNK."""
+    mapping = {'A': 'DA', 'C': 'DC', 'G': 'DG', 'T': 'DT',
+               'DA': 'DA', 'DC': 'DC', 'DG': 'DG', 'DT': 'DT'}
+    return mapping.get(resname.upper().strip(), 'DUNK')
+
+
+def _normalize_dna_entity_seq(raw: str) -> str:
+    """Convert an entity_poly sequence (uppercase A/C/G/T) to lowercase a/c/g/t."""
+    return ''.join(_DNA_RESNAME_TO_1.get(ch.upper(), 'n') for ch in raw if ch.isalpha())
+
+
+def _dna_fallback_sequence(rows: List[List[str]], columns: List[str]) -> str:
+    """Derive a DNA single-letter sequence from atom_site residue names."""
+    label_seq_col = columns.index("_atom_site.label_seq_id")
+    label_comp_col = columns.index("_atom_site.label_comp_id")
+    residue_names: Dict[int, str] = {}
+    max_seq = 0
+    for row in rows:
+        label_seq = row[label_seq_col]
+        if label_seq in {"?", "."}:
+            continue
+        seq_index = int(label_seq) - 1
+        residue_names[seq_index] = row[label_comp_col].upper()
+        max_seq = max(max_seq, seq_index + 1)
+    if max_seq == 0:
+        raise ValueError("Could not infer DNA sequence from atom_site rows.")
+    letters = ['n'] * max_seq
+    for seq_index, resname in residue_names.items():
+        letters[seq_index] = _DNA_RESNAME_TO_1.get(resname, 'n')
+    return ''.join(letters)
 
 
 def _clean_sequence(raw_sequence: str) -> str:
@@ -323,6 +369,34 @@ class ChainAtoms:
     resolution: float
 
 
+@dataclass
+class DnaChainAtoms:
+    """One parsed DNA chain, parallel to ChainAtoms for protein chains.
+
+    Fields:
+    * ``nuctype``: ``(N_nuc,)`` int IDs in [0, NUM_DNA_TOKENS-1].
+      0=DA, 1=DC, 2=DG, 3=DT, 4=DUNK.  The embedding layer adds
+      DNA_TOKEN_OFFSET to mix these into the joint protein+DNA vocabulary.
+    * ``residue_index``: ``(N_nuc,)`` contiguous 0..N-1 (same convention
+      as ChainAtoms — not author numbering).
+    * ``atom14_positions``: ``(N_nuc, 14, 3)`` Å coordinates in the
+      per-nucleotide atom14 slot ordering from ``dna_restype_name_to_atom14_names``.
+      Slots 0–10 are the sugar-phosphate backbone; slots 11–13 are
+      nucleotide-specific base atoms.
+    * ``atom14_mask``: ``(N_nuc, 14)`` 1 where a coordinate was present.
+    * ``resolution``: Å, shared with the protein chain from the same entry.
+    """
+
+    pdb_id: str
+    chain_id: str
+    sequence: str          # lowercase a/c/g/t
+    nuctype: np.ndarray    # (N_nuc,) int32, values in [0, NUM_DNA_TOKENS-1]
+    residue_index: np.ndarray
+    atom14_positions: np.ndarray
+    atom14_mask: np.ndarray
+    resolution: float
+
+
 def _first_tag_value(
     tag: str,
     scalars: Dict[str, str],
@@ -441,6 +515,88 @@ def extract_chain_atoms(
         # Canonical AF2/OpenFold sequence features use contiguous 0..N-1 residue
         # indices from sequence order, not author numbering from the mmCIF.
         residue_index=np.arange(len(sequence), dtype=np.int32),
+        atom14_positions=atom14_positions,
+        atom14_mask=atom14_mask,
+        resolution=resolution,
+    )
+
+
+def extract_dna_chain_atoms(
+    mmcif_path: str | Path,
+    pdb_id: str,
+    chain_id: str,
+) -> DnaChainAtoms:
+    """Parse ``mmcif_path`` and return the atom14 structure for a DNA ``chain_id``.
+
+    Mirrors ``extract_chain_atoms`` for protein chains. Handles both the
+    modern D-prefix naming (DA/DC/DG/DT) and bare single-letter naming
+    (A/C/G/T) found in some older depositions. Residues with no coordinates
+    get zeroed positions and an all-zero mask.
+    """
+    mmcif_path = Path(mmcif_path)
+    scalars, loops = _parse_mmcif(mmcif_path.read_text())
+    entity_sequences = _entity_sequences(scalars, loops)
+    resolution = _parse_resolution(scalars, loops)
+
+    atom_columns: List[str] | None = None
+    atom_rows: List[List[str]] | None = None
+    for columns, rows in loops:
+        if columns and columns[0].startswith("_atom_site."):
+            atom_columns = columns
+            atom_rows = rows
+            break
+
+    if atom_columns is None or atom_rows is None:
+        raise ValueError(f"No _atom_site loop found in {mmcif_path}")
+
+    filtered_rows, _ = _select_atom_rows(atom_columns, atom_rows, chain_id)
+
+    group_col = atom_columns.index("_atom_site.group_PDB")
+    model_col = atom_columns.index("_atom_site.pdbx_PDB_model_num")
+    entity_col = atom_columns.index("_atom_site.label_entity_id")
+
+    atom_only_rows = [row for row in filtered_rows if row[group_col] == "ATOM"]
+    if not atom_only_rows:
+        raise ValueError(f"No ATOM rows found for DNA chain '{chain_id}' in {mmcif_path}")
+
+    first_model = atom_only_rows[0][model_col]
+    atom_only_rows = [row for row in atom_only_rows if row[model_col] == first_model]
+
+    entity_id = atom_only_rows[0][entity_col]
+    raw_sequence = entity_sequences.get(entity_id)
+    if raw_sequence is not None:
+        # entity_poly sequences for DNA are uppercase A/C/G/T without D-prefix.
+        sequence = _normalize_dna_entity_seq(raw_sequence)
+    else:
+        sequence = _dna_fallback_sequence(atom_only_rows, atom_columns)
+
+    n_nuc = len(sequence)
+    atom14_positions = np.zeros((n_nuc, 14, 3), dtype=np.float32)
+    atom14_mask = np.zeros((n_nuc, 14), dtype=np.float32)
+
+    for (seq_index, atom_name), (coordinates, residue_name) in _best_atom_rows(
+        atom_only_rows, atom_columns
+    ).items():
+        if seq_index < 0 or seq_index >= n_nuc:
+            continue
+        canonical = _normalize_dna_resname(residue_name)
+        atom_index = DNA_ATOM14_INDEX.get(canonical, {}).get(atom_name)
+        if atom_index is None:
+            continue
+        atom14_positions[seq_index, atom_index] = coordinates
+        atom14_mask[seq_index, atom_index] = 1.0
+
+    nuctype = np.array(
+        [dna_restype_order.get(ch, NUM_DNA_TOKENS - 1) for ch in sequence],
+        dtype=np.int32,
+    )
+
+    return DnaChainAtoms(
+        pdb_id=pdb_id.lower(),
+        chain_id=chain_id,
+        sequence=sequence,
+        nuctype=nuctype,
+        residue_index=np.arange(n_nuc, dtype=np.int32),
         atom14_positions=atom14_positions,
         atom14_mask=atom14_mask,
         resolution=resolution,
