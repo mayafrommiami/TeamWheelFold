@@ -1,6 +1,8 @@
-# minAlphaFold2
+# TeamWheelFold
 
 A minimal, pedagogical PyTorch reimplementation of [AlphaFold2](https://www.nature.com/articles/s41586-021-03819-2) — the model architecture in ~3,000 lines of pure PyTorch, ~9,000 across the whole package including losses, data pipeline, and training loop. Every module maps 1:1 to a numbered algorithm in the [62-page supplement](af2_paper.pdf).
+
+**This fork extends minAlphaFold2 with protein-DNA interaction prediction** (branch `feature/protein-dna`). See [Protein-DNA extension](#protein-dna-extension) below.
 
 Inspired by Andrej Karpathy's [minGPT](https://github.com/karpathy/minGPT).
 
@@ -15,6 +17,25 @@ AlphaFold2 is one of the most consequential deep learning systems ever shipped, 
 This repo aims to elimintate this bottleneck by trading production-readiness for a single property: you can sit down and read AlphaFold2 cover-to-cover in an afternoon. Every file is named after the supplement section it implements, every unusual design choice cites a paper line, and the full training recipe from Supplementary Table 4 is driven by one config.
 
 Note that this repo is **not** an inference harness around DeepMind's weights, **not** a speed benchmark, and **not** a AF2 multimer / AF3 implementation. It is a compact, trainable single-file-per-algorithm reference you can fork, tweak, and run end-to-end on a single GPU.
+
+## Protein-DNA extension
+
+The `feature/protein-dna` branch extends the monomer architecture to predict **protein-DNA complex structures**. This is a phased implementation:
+
+| Phase | Files changed | What it adds | Status |
+|-------|--------------|--------------|--------|
+| 1 | `residue_constants.py`, `mmcif.py` | DNA vocabulary (tokens 21–25), 14-slot atom representation, C4'–C3'–C1' frame definition, `DnaChainAtoms` dataclass, mmCIF parser for DNA chains | ✅ Done |
+| 2 | `embedders.py` | `JointInputEmbedder` (27-dim joint token vocab), `ChainTypeEmbedder` (protein/DNA pair bias in z), `JOINT_FEAT_DIM` constant | ✅ Done |
+| 3 | `structure_module.py` | DNA backbone frames from C4'–C3'–C1', sugar pucker + glycosidic torsion angles | Planned |
+| 4 | `losses.py` | FAPE over DNA frames, phosphodiester violation loss | Planned |
+
+### Design decisions
+
+- **Token vocabulary**: protein tokens 0–20, DNA tokens 21–25 (lowercase a/c/g/t + DUNK). Lowercase distinguishes nucleotides from amino acids throughout the codebase.
+- **Chain-type embedding**: a learned 2-token embedding added to z_ij as `embed(type_i) + embed(type_j)` gives the Evoformer four distinguishable pair contexts (protein–protein, protein–DNA, DNA–DNA) with minimal parameters.
+- **No MSA for DNA**: DNA positions receive zero MSA features. The chain-type embedding compensates — the model learns that DNA positions have no evolutionary co-variation signal.
+- **RelPos inter-chain gap**: protein and DNA residue indices are separated by a gap ≥ 200 so RelPos treats them as maximally far apart, preserving its within-chain positional encoding semantics.
+- **Single-stranded DNA first**: double-helix base-pairing is out of scope for the initial implementation.
 
 ## What's here
 
