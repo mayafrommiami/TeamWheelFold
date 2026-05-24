@@ -29,6 +29,7 @@ from .residue_constants import (
     restype_atom14_to_rigid_group,
     restype_atom14_mask,
 )
+from .geometry import rigid_frame_from_three_points, torsion_sin_cos_from_four_points
 
 
 def _truncated_normal_(tensor: torch.Tensor, std: float) -> None:
@@ -837,3 +838,106 @@ def compute_all_atom_coordinates(
     atom_coords = torch.einsum('bnaij, bnaj -> bnai', atom_R, lit_pos) + atom_t
 
     return all_frames_R, all_frames_t, atom_coords, mask
+
+
+# ── DNA backbone geometry ─────────────────────────────────────────────────────
+
+# DNA atom14 slot assignments (same for all four nucleotides):
+#   0=P  1=OP1  2=OP2  3=O5'  4=C5'  5=C4'  6=O4'  7=C3'  8=O3'  9=C2'  10=C1'
+#   11-13: nucleotide-specific base atoms
+_DNA_C4P  = 5   # C4'  — frame origin
+_DNA_C3P  = 7   # C3'  — defines x-axis direction (at negative-x side of C4')
+_DNA_C1P  = 10  # C1'  — in the xy-plane (glycosidic bond anchor)
+_DNA_O4P  = 6   # O4'  — first atom of glycosidic torsion O4'-C1'-N/base
+_DNA_BASE1 = 11  # N9 (purines) or N1 (pyrimidines) — glycosidic bond to C1'
+_DNA_BASE2 = 12  # C8 (purines) or C4 (pyrimidines) — second base atom for chi
+
+
+def dna_backbone_frames(
+    atom14_positions: torch.Tensor,
+    atom14_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build one rigid backbone frame per DNA nucleotide (analogous to protein backbone_frames).
+
+    The frame is defined by three sugar atoms using Gram-Schmidt orthogonalisation
+    (``geometry.rigid_frame_from_three_points``):
+
+    * **Origin**: C4' (slot 5) — the frame centre.
+    * **Negative-x side**: C3' (slot 7) — x-axis points from C3' toward C4'.
+    * **xy-plane**: C1' (slot 10) — defines the y-axis direction.
+
+    This convention is analogous to the protein backbone frame (C, Cα, N) and
+    places the glycosidic bond axis (C4'→C1') roughly in the local xy-plane.
+
+    Args:
+        atom14_positions: ``(batch, N_nuc, 14, 3)`` Å coordinates.
+        atom14_mask:      ``(batch, N_nuc, 14)``    1 where coordinate is present.
+
+    Returns:
+        rotations:   ``(batch, N_nuc, 3, 3)``  — identity where frame atoms missing.
+        translations:``(batch, N_nuc, 3)``      — zero where frame atoms missing.
+        frame_mask:  ``(batch, N_nuc)``          — 1 iff all three frame atoms present.
+    """
+    c4p = atom14_positions[..., _DNA_C4P, :]   # (batch, N_nuc, 3)
+    c3p = atom14_positions[..., _DNA_C3P, :]
+    c1p = atom14_positions[..., _DNA_C1P, :]
+
+    c4p_mask = atom14_mask[..., _DNA_C4P]      # (batch, N_nuc)
+    c3p_mask = atom14_mask[..., _DNA_C3P]
+    c1p_mask = atom14_mask[..., _DNA_C1P]
+    frame_mask = c4p_mask * c3p_mask * c1p_mask  # (batch, N_nuc)
+
+    # Build frames: origin=C4', neg-x=C3', xy-plane=C1'
+    rotations, translations = rigid_frame_from_three_points(
+        point_on_neg_x_axis=c3p,
+        origin=c4p,
+        point_on_xy_plane=c1p,
+    )   # rotations: (batch, N_nuc, 3, 3), translations: (batch, N_nuc, 3)
+
+    # Zero out frames for nucleotides with missing atoms
+    identity = torch.eye(3, device=rotations.device, dtype=rotations.dtype)
+    valid = frame_mask[..., None, None]  # (batch, N_nuc, 1, 1)
+    rotations   = torch.where(valid > 0, rotations,   identity)
+    translations = torch.where(frame_mask[..., None] > 0, translations,
+                               torch.zeros_like(translations))
+
+    return rotations, translations, frame_mask
+
+
+def dna_torsion_angles(
+    atom14_positions: torch.Tensor,
+    atom14_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute the glycosidic torsion angle χ for each DNA nucleotide.
+
+    χ is the dihedral O4'–C1'–N(glycosidic)–C(base), where:
+
+    * For **purines** (DA, DG):  O4'(6)–C1'(10)–N9(11)–C8(12)
+    * For **pyrimidines** (DC, DT): O4'(6)–C1'(10)–N1(11)–C4(12)
+
+    Both path types use the same slot indices (6, 10, 11, 12) because the
+    ``dna_restype_name_to_atom14_names`` layout places the glycosidic-bond
+    nitrogen at slot 11 and the adjacent base carbon at slot 12 for all four
+    nucleotide types. No nuctype branching is needed.
+
+    Returns:
+        angles: ``(batch, N_nuc, 2)`` — (sin χ, cos χ) pairs, zero where masked.
+        mask:   ``(batch, N_nuc)``    — 1 iff all four torsion atoms present.
+    """
+    o4p  = atom14_positions[..., _DNA_O4P,   :]  # (batch, N_nuc, 3)
+    c1p  = atom14_positions[..., _DNA_C1P,   :]
+    base1 = atom14_positions[..., _DNA_BASE1, :]
+    base2 = atom14_positions[..., _DNA_BASE2, :]
+
+    torsion_mask = (
+        atom14_mask[..., _DNA_O4P]
+        * atom14_mask[..., _DNA_C1P]
+        * atom14_mask[..., _DNA_BASE1]
+        * atom14_mask[..., _DNA_BASE2]
+    )  # (batch, N_nuc)
+
+    sin_cos = torsion_sin_cos_from_four_points(o4p, c1p, base1, base2)
+    # (batch, N_nuc, 2)
+
+    sin_cos = sin_cos * torsion_mask[..., None]
+    return sin_cos, torsion_mask
