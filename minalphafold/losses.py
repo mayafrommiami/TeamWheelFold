@@ -43,6 +43,8 @@ from .residue_constants import (
     between_res_cos_angles_c_n_ca, between_res_cos_angles_ca_c_n,
     make_atom14_dists_bounds,
     restype_atom14_vdw_radius,
+    between_res_dna_bond_length_o3p,
+    between_res_dna_bond_length_stddev_o3p,
 )
 
 
@@ -1396,3 +1398,106 @@ class StructuralViolationLoss(torch.nn.Module):
             "per_atom_violations": per_atom_violations,
             "per_atom_num_clash": per_atom_num_clash,
         }
+
+
+class DnaBackboneFAPE(torch.nn.Module):
+    """FAPE over DNA backbone frames (analogue of BackboneFAPE for nucleotides).
+
+    Uses DNA C4'/C3'/C1' frames from `dna_backbone_frames` (structure_module)
+    and scores frame translations (C4' positions) as the supervised atoms,
+    mirroring how BackboneFAPE uses Cα positions. The clamp radius is set to
+    30 Å (vs. protein's 10 Å) to accommodate the larger positional uncertainty
+    in DNA backbones relative to protein α-carbon traces.
+
+    Inputs follow the same conventions as BackboneFAPE: rotations (B, N, 3, 3)
+    and translations (B, N, 3); masks mark valid nucleotides.
+    """
+
+    def __init__(self, d_clamp: float = 30.0, eps: float = 1e-4, Z: float = 10.0):
+        super().__init__()
+        self.eps = eps
+        self.d_clamp_val = d_clamp
+        self.Z = Z
+
+    def forward(
+        self,
+        predicted_rotations,         # (b, N_nuc, 3, 3)
+        predicted_translations,      # (b, N_nuc, 3)
+        true_rotations,              # (b, N_nuc, 3, 3)
+        true_translations,           # (b, N_nuc, 3)
+        frame_mask: torch.Tensor,    # (b, N_nuc)
+        position_mask: torch.Tensor, # (b, N_nuc)
+        pair_mask: Optional[torch.Tensor] = None,  # (b, N_nuc, N_nuc)
+        l1_clamp_distance: Optional[float] = None,
+    ):
+        # As with BackboneFAPE, the DNA frame translations (C4' positions)
+        # serve double duty as both frames and atoms.
+        return frame_aligned_point_error(
+            predicted_rotations,
+            predicted_translations,
+            true_rotations,
+            true_translations,
+            predicted_translations,
+            true_translations,
+            frame_mask,
+            position_mask,
+            length_scale=self.Z,
+            pair_mask=pair_mask,
+            l1_clamp_distance=l1_clamp_distance,
+            eps=self.eps,
+        )
+
+
+class DnaViolationLoss(torch.nn.Module):
+    """Phosphodiester-bond violation loss for DNA chains.
+
+    Penalises deviations of the O3'(i) → P(i+1) inter-nucleotide bond length
+    from the literature value (1.607 ± 0.020 Å) using the same flat-bottom L1
+    pattern as `StructuralViolationLoss.between_residue_bond_and_angle_loss`:
+
+        loss_i = relu(|d_i - μ| - τ · σ)
+
+    where d_i is the predicted O3'(i)–P(i+1) distance, μ = 1.607 Å,
+    σ = 0.020 Å, and τ = `violation_tolerance_factor` (default 12, matching
+    the protein-side `StructuralViolationLoss`).
+
+    Atom14 slot conventions for DNA (all nucleotides):
+        slot 0 = P,   slot 8 = O3'
+
+    `residue_index` is used to detect chain breaks (gap > 1 step) so that
+    cross-chain O3'→P pairs are not penalised.
+    """
+
+    def __init__(self, violation_tolerance_factor: float = 12.0):
+        super().__init__()
+        self.violation_tolerance_factor = violation_tolerance_factor
+
+    def forward(
+        self,
+        predicted_positions,  # (batch, N_nuc, 14, 3)
+        atom_mask,            # (batch, N_nuc, 14)
+        residue_index,        # (batch, N_nuc)
+    ) -> torch.Tensor:        # (batch,)
+        eps = 1e-6
+
+        # O3' is slot 8 of nucleotide i; P is slot 0 of nucleotide i+1.
+        this_o3p_pos  = predicted_positions[:, :-1, 8, :]   # (batch, N_nuc-1, 3)
+        this_o3p_mask = atom_mask[:, :-1, 8]                 # (batch, N_nuc-1)
+        next_p_pos    = predicted_positions[:, 1:,  0, :]   # (batch, N_nuc-1, 3)
+        next_p_mask   = atom_mask[:, 1:,  0]                 # (batch, N_nuc-1)
+
+        # Exclude pairs that span chain breaks (residue index gap > 1).
+        has_no_gap_mask = (residue_index[:, 1:] - residue_index[:, :-1] == 1).to(
+            predicted_positions.dtype
+        )
+
+        bond_length = torch.sqrt(
+            torch.sum((this_o3p_pos - next_p_pos) ** 2, dim=-1) + eps
+        )
+        error = torch.sqrt((bond_length - between_res_dna_bond_length_o3p) ** 2 + eps)
+        tolerance = self.violation_tolerance_factor * between_res_dna_bond_length_stddev_o3p
+        loss_per_pair = torch.relu(error - tolerance)
+
+        bond_mask = this_o3p_mask * next_p_mask * has_no_gap_mask
+        denom = torch.sum(bond_mask, dim=-1).clamp(min=eps)
+        return torch.sum(bond_mask * loss_per_pair, dim=-1) / denom
