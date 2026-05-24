@@ -45,6 +45,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from .a3m import GAP_ID, MASK_ID, MSA_ALPHABET_SIZE, SEQ_ALPHABET_SIZE
+from .embedders import JOINT_FEAT_DIM
 from .geometry import (
     atom14_to_rigid_group_frames,
     alternative_atom14_ground_truth,
@@ -54,18 +55,21 @@ from .geometry import (
     torsion_angles,
 )
 from .residue_constants import (
+    DNA_TOKEN_OFFSET,
+    NUM_DNA_TOKENS,
     STANDARD_ATOM_MASK,
     atom_type_num,
     restype_atom14_to_atom37,
     restype_rigid_group_default_frame,
 )
-from .structure_module import rigid_group_frames_from_torsions
+from .structure_module import dna_backbone_frames, rigid_group_frames_from_torsions
 
 # Table 1 feature dimensions.
 TEMPLATE_PAIR_BINS = 39              # distogram: 38 equal-width + 1 catch-all
 TEMPLATE_PAIR_DIM = 88               # 39 distogram + 1 mask + 22+22 aatype + 3 unit-vec + 1 mask
 TEMPLATE_ANGLE_DIM = 57              # 22 aatype + 14 torsion + 14 alt-torsion + 7 torsion mask
-TARGET_FEAT_DIM = SEQ_ALPHABET_SIZE + 1  # 21 aatype + 1 between_segment_residues
+TARGET_FEAT_DIM = SEQ_ALPHABET_SIZE + 1  # 21 aatype + 1 between_segment_residues (protein-only)
+JOINT_TARGET_FEAT_DIM = JOINT_FEAT_DIM   # 27 = 1 break + 26 joint one-hot (protein + DNA)
 MSA_FEAT_DIM = MSA_ALPHABET_SIZE + 1 + 1 + MSA_ALPHABET_SIZE + 1  # 49, Table 1 msa_feat
 EXTRA_MSA_FEAT_DIM = MSA_ALPHABET_SIZE + 1 + 1                    # 25, Table 1 extra_msa_feat
 
@@ -219,12 +223,18 @@ def _load_processed_features(path: Path) -> Dict[str, torch.Tensor]:
         else:
             residue_index = torch.arange(aatype.shape[0], dtype=torch.long)
 
+        if "chain_type" in feature_data.files:
+            chain_type = torch.from_numpy(feature_data["chain_type"]).long()
+        else:
+            chain_type = torch.zeros_like(aatype)
+
         return {
             "aatype": aatype,
             "msa": torch.from_numpy(feature_data["msa"]).long(),
             "deletions": torch.from_numpy(feature_data["deletions"]).long(),
             "between_segment_residues": between_segment_residues,
             "residue_index": residue_index,
+            "chain_type": chain_type,
             "template_aatype": torch.from_numpy(feature_data["template_aatype"]).long(),
             "template_atom14_positions": torch.from_numpy(feature_data["template_atom14_positions"]).float(),
             "template_atom14_mask": torch.from_numpy(feature_data["template_atom14_mask"]).float(),
@@ -345,6 +355,8 @@ def crop_example(
     cropped["crop_start"] = start
     # Residue axis only: (N_res,) -> (crop_size,)
     cropped["aatype"] = example["aatype"][residue_slice]
+    if "chain_type" in example:
+        cropped["chain_type"] = example["chain_type"][residue_slice]
     # MSA residue axis: (N_seq, N_res) -> (N_seq, crop_size)
     cropped["msa"] = example["msa"][:, residue_slice]
     cropped["deletions"] = example["deletions"][:, residue_slice]
@@ -702,6 +714,71 @@ def build_target_feat(
         num_classes=SEQ_ALPHABET_SIZE,
     ).float()
     return torch.cat([has_break, aatype_one_hot], dim=-1)
+
+
+def build_joint_target_feat(
+    aatype: torch.Tensor,
+    between_segment_residues: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Build 27-dim ``target_feat`` for joint protein + DNA sequences.
+
+    Extends :func:`build_target_feat` to the full joint vocabulary
+    (21 protein tokens + 5 DNA tokens = 26 slots) plus the 1-dim chain-break
+    flag, giving 27 total dimensions (``JOINT_TARGET_FEAT_DIM``).
+
+    For protein-only inputs all DNA slots are zero; for joint sequences
+    the DNA nucleotide one-hot occupies slots 21-25 of the one-hot block.
+    """
+    if between_segment_residues is None:
+        between_segment_residues = torch.zeros_like(aatype)
+    has_break = between_segment_residues.float().clamp(0.0, 1.0).unsqueeze(-1)
+    joint_vocab = SEQ_ALPHABET_SIZE + NUM_DNA_TOKENS  # 26
+    aatype_one_hot = F.one_hot(aatype.clamp(0, joint_vocab - 1), num_classes=joint_vocab).float()
+    return torch.cat([has_break, aatype_one_hot], dim=-1)  # (N, 27)
+
+
+def build_dna_supervision(
+    aatype: torch.Tensor,            # (N_total,) joint — DNA tokens at DNA positions
+    atom14_positions: torch.Tensor,  # (N_total, 14, 3) joint atom positions
+    atom14_mask: torch.Tensor,       # (N_total, 14)
+) -> Dict[str, torch.Tensor]:
+    """Build DNA backbone frame ground-truth for :class:`~losses.DnaBackboneFAPE`.
+
+    Extracts C4'/C3'/C1' frames for every nucleotide, then scatters them back
+    into a ``(N_total, …)`` tensor with protein positions set to identity/zero.
+    The resulting tensors are passed to ``AlphaFoldLoss`` as
+    ``true_dna_backbone_rot / trans / frame_mask``.
+
+    Returns an empty dict when no DNA residues are present.
+    """
+    dna_mask_bool = aatype >= DNA_TOKEN_OFFSET          # (N_total,) bool
+    if not dna_mask_bool.any():
+        return {}
+
+    dna_idx = torch.where(dna_mask_bool)[0]             # (N_dna,) int
+    N_total = aatype.shape[0]
+
+    dna_pos   = atom14_positions[dna_idx].unsqueeze(0)  # (1, N_dna, 14, 3)
+    dna_amask = atom14_mask[dna_idx].unsqueeze(0)       # (1, N_dna, 14)
+
+    dna_rot, dna_trans, dna_fmask = dna_backbone_frames(dna_pos, dna_amask)
+    # dna_rot: (1, N_dna, 3, 3), dna_trans: (1, N_dna, 3), dna_fmask: (1, N_dna)
+
+    # Scatter into N_total space (identity rotation, zero translation for protein slots)
+    full_rot   = atom14_positions.new_zeros(N_total, 3, 3)
+    full_rot[:, 0, 0] = 1.0; full_rot[:, 1, 1] = 1.0; full_rot[:, 2, 2] = 1.0
+    full_trans = atom14_positions.new_zeros(N_total, 3)
+    full_fmask = atom14_mask.new_zeros(N_total)
+
+    full_rot[dna_idx]   = dna_rot[0]
+    full_trans[dna_idx] = dna_trans[0]
+    full_fmask[dna_idx] = dna_fmask[0]
+
+    return {
+        "true_dna_backbone_rot":   full_rot,
+        "true_dna_backbone_trans": full_trans,
+        "true_dna_frame_mask":     full_fmask,
+    }
 
 
 def build_atom37_masks(
@@ -1209,12 +1286,31 @@ def build_processed_example_from_cropped(
     """Convert one cropped raw example into model inputs plus supervision."""
     n_res = example["aatype"].shape[0]
 
+    aatype = example["aatype"]
+    atom14_positions = example["atom14_positions"]
+    atom14_mask_raw = example["atom14_mask"]
+
+    # Zero out atom14_mask at DNA positions so protein-style supervision
+    # (backbone FAPE, torsion loss, etc.) doesn't fire on nucleotides.
+    # DNA supervision comes separately via build_dna_supervision below.
+    dna_positions = aatype >= DNA_TOKEN_OFFSET           # (N_res,) bool
+    protein_atom14_mask = atom14_mask_raw.clone()
+    if dna_positions.any():
+        protein_atom14_mask[dna_positions] = 0.0
+
+    # Clamp DNA tokens to UNK (20) for all protein-specific supervision functions.
+    protein_aatype = aatype.clamp(max=20)
+
+    # chain_type: (N_res,) int — 0=protein, 1=DNA; default zeros for protein-only data.
+    chain_type = example.get("chain_type", torch.zeros(n_res, dtype=torch.long))
+
     processed = {
         "chain_id": example["chain_id"],
-        "aatype": example["aatype"],
+        "aatype": aatype,
+        "chain_type": chain_type,
         "resolution": torch.as_tensor(example.get("resolution", 0.0)).float(),
-        "target_feat": build_target_feat(
-            example["aatype"],
+        "target_feat": build_joint_target_feat(
+            aatype,
             example.get("between_segment_residues"),
         ),
         "residue_index": _residue_index_for_example(example),
@@ -1235,7 +1331,8 @@ def build_processed_example_from_cropped(
             random_seed=random_seed,
         )
     )
-    processed.update(build_supervision(example["aatype"], example["atom14_positions"], example["atom14_mask"]))
+    processed.update(build_supervision(protein_aatype, atom14_positions, protein_atom14_mask))
+    processed.update(build_dna_supervision(aatype, atom14_positions, atom14_mask_raw))
     return processed
 
 
@@ -1351,8 +1448,9 @@ def collate_batch(
     padding_shapes = {
         # Model inputs.
         "aatype": (max_length,),
+        "chain_type": (max_length,),
         "resolution": (),
-        "target_feat": (max_length, TARGET_FEAT_DIM),
+        "target_feat": (max_length, JOINT_TARGET_FEAT_DIM),
         "residue_index": (max_length,),
         "seq_mask": (max_length,),
         # MSA inputs and masked-MSA supervision.
@@ -1390,8 +1488,17 @@ def collate_batch(
         "pseudo_beta_mask": (max_length,),
         "pseudo_beta_positions": (max_length, 3),
     }
+    # DNA supervision keys are optional (only present for protein-DNA complexes).
+    dna_supervision_shapes = {
+        "true_dna_backbone_rot":   (max_length, 3, 3),
+        "true_dna_backbone_trans": (max_length, 3),
+        "true_dna_frame_mask":     (max_length,),
+    }
     for key, target_shape in padding_shapes.items():
         stack(key, target_shape=target_shape)
+    for key, target_shape in dna_supervision_shapes.items():
+        if any(key in item for item in processed):
+            stack(key, target_shape=target_shape)
 
     if sampled_msa_features:
         def stack_sampled(key: str, *, fill_value: float = 0.0, target_shape: Sequence[int]) -> None:
@@ -1423,3 +1530,50 @@ def collate_batch(
             stack_sampled(key, target_shape=sampled_padding_shapes[key])
 
     return batch
+
+
+class ProteinDnaDataset(Dataset):
+    """Dataset over preprocessed protein-DNA complex ``.npz`` files.
+
+    Expects the same directory layout as :class:`ProcessedOpenProteinSetDataset`
+    but with feature NPZs that contain joint sequences:
+
+    * ``aatype`` — (N_protein + N_dna,) int64, protein tokens 0-20 followed
+      by DNA tokens 21-25 (using a gap ≥ 200 in ``residue_index``).
+    * ``chain_type`` — (N_total,) int64, 0=protein, 1=DNA.
+    * ``msa`` — (N_seq, N_total) int64, zero-padded at DNA positions.
+    * All other fields follow the same conventions as
+      :class:`ProcessedOpenProteinSetDataset`.
+
+    The preprocessing script ``scripts/preprocess_protein_dna.py`` produces
+    files in this format from mmCIF protein-DNA complex structures.
+    """
+
+    def __init__(
+        self,
+        processed_features_dir: str | Path,
+        processed_labels_dir: str | Path,
+        *,
+        split: str = "train",
+        val_fraction: float = 0.1,
+        seed: int = 0,
+        chains_manifest: str | Path | None = None,
+    ):
+        self.processed_features_dir = Path(processed_features_dir)
+        self.processed_labels_dir = Path(processed_labels_dir)
+        chain_ids = discover_chain_ids(self.processed_features_dir, self.processed_labels_dir)
+        if chains_manifest is not None:
+            allowed = set(load_accepted_chains_from_manifest(chains_manifest))
+            chain_ids = [c for c in chain_ids if c in allowed]
+        self.chain_ids = split_chain_ids(chain_ids, split=split, val_fraction=val_fraction, seed=seed)
+        self.split = split
+
+    def __len__(self) -> int:
+        return len(self.chain_ids)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        chain_id = self.chain_ids[index]
+        example: Dict[str, Any] = {"chain_id": chain_id}
+        example.update(_load_processed_features(self.processed_features_dir / f"{chain_id}.npz"))
+        example.update(_load_processed_labels(self.processed_labels_dir / f"{chain_id}.npz"))
+        return example

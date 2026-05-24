@@ -250,12 +250,15 @@ class StructureModule(torch.nn.Module):
 
             # Algorithm 20, lines 11-18: side-chain torsions and auxiliary losses use
             # the updated (un-detached) T_i so gradients reach this iteration's s.
+            # DNA tokens (≥ 21) are clamped to UNK (20) for the protein-specific
+            # atom-placement tables; their geometry is supervised by DnaBackboneFAPE.
+            protein_aatype = aatype.clamp(max=20)
             sidechain_outputs = self.sidechain_module(
                 s,
                 initial_single_representation,
                 rotations,
                 translations,
-                aatype,
+                protein_aatype,
                 self.default_frames,
                 self.lit_positions,
                 self.atom_frame_idx_table,

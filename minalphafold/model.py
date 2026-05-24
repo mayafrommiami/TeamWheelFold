@@ -4,7 +4,7 @@ from typing import cast
 import torch
 import torch.utils.checkpoint as torch_checkpoint
 
-from .embedders import ExtraMsaStack, InputEmbedder, TemplatePair, TemplatePointwiseAttention
+from .embedders import ExtraMsaStack, JointInputEmbedder, TemplatePair, TemplatePointwiseAttention
 from .evoformer import Evoformer
 from .heads import DistogramHead, ExperimentallyResolvedHead, MaskedMSAHead, PLDDTHead, TMScoreHead
 from .initialization import init_gate_linear, init_linear, zero_linear
@@ -55,7 +55,7 @@ class AlphaFold2(torch.nn.Module):
         self.evoformer_blocks = torch.nn.ModuleList([Evoformer(config) for _ in range(config.num_evoformer)])
         self.structure_model = StructureModule(config)
 
-        self.input_embedder = InputEmbedder(config)
+        self.input_embedder = JointInputEmbedder(config)
 
         # Recycling embedders (Algorithm 32): LN-only for single/pair reps; distance bins use a learned linear
         self.recycle_norm_s = torch.nn.LayerNorm(config.c_m)
@@ -193,6 +193,7 @@ class AlphaFold2(torch.nn.Module):
             n_ensemble: int = 1,
             detach_rotations: bool = True,
             sample_recycles: bool | None = None,
+            chain_type: torch.Tensor | None = None,
         ):
         """Algorithm 2 forward pass. See the class docstring for the full map."""
         # seq_mask: (batch, N_res) — 1 for valid residues, 0 for padding
@@ -258,11 +259,12 @@ class AlphaFold2(torch.nn.Module):
                     msa_mask_current = self._sampled_feature_slice(msa_mask, i, ensemble_index, base_ndim=3)
                     extra_msa_mask_current = self._sampled_feature_slice(extra_msa_mask, i, ensemble_index, base_ndim=3)
 
-                    # Algorithm 2 line 5 (= Algorithm 3 / InputEmbedder).
+                    # Algorithm 2 line 5 (= Algorithm 3 / JointInputEmbedder).
                     msa_representation, pair_representation = self.input_embedder(
                         target_feat,
                         residue_index,
                         msa_feat_current,
+                        chain_type=chain_type,
                     )
 
                     # Algorithm 2 line 6 (= Algorithm 32 / RecyclingEmbedder):
@@ -424,16 +426,20 @@ class AlphaFold2(torch.nn.Module):
                 single_rep_prev = msa_first_row.detach()
                 z_prev = pair_repr.detach()
 
-                # Pseudo-β: Cα for glycine (atom14 index 1, since GLY has no Cβ),
-                # Cβ otherwise (atom14 index 4). Matches the pseudo-β convention
-                # used throughout AF2 for pairwise distances (supplement 1.9.8,
-                # Algorithm 32 line 1). aatype==7 is glycine in AF2's alphabet.
-                is_gly = (aatype == 7)
-                cb_idx = torch.where(is_gly, 1, 4)
-                atom_coords = structure_predictions["atom14_coords"]
-                x_prev = torch.gather(
-                    atom_coords, 2,
-                    cb_idx[:, :, None, None].expand(-1, -1, 1, 3),
-                ).squeeze(2).detach()
+                # Pseudo-β for recycling (Algorithm 32 line 1):
+                # For protein-only batches: Cα (slot 1) for GLY, Cβ (slot 4) otherwise.
+                # For protein-DNA batches: use backbone frame translations directly so
+                # that DNA positions (which have neither Cα nor Cβ) also produce a
+                # valid distance signal. final_translations ≡ Cα for protein frames.
+                if chain_type is not None:
+                    x_prev = structure_predictions["final_translations"].detach()
+                else:
+                    is_gly = (aatype == 7)
+                    cb_idx = torch.where(is_gly, 1, 4)
+                    atom_coords = structure_predictions["atom14_coords"]
+                    x_prev = torch.gather(
+                        atom_coords, 2,
+                        cb_idx[:, :, None, None].expand(-1, -1, 1, 3),
+                    ).squeeze(2).detach()
 
         raise ValueError("n_cycles and n_ensemble must be > 0")

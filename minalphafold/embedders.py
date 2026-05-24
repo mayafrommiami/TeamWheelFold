@@ -177,7 +177,7 @@ class JointInputEmbedder(torch.nn.Module):
         target_feat:   torch.Tensor,
         residue_index: torch.Tensor,
         msa_feat:      torch.Tensor,
-        chain_type:    torch.Tensor,
+        chain_type:    Optional[torch.Tensor] = None,
     ):
         """
         Args:
@@ -188,7 +188,12 @@ class JointInputEmbedder(torch.nn.Module):
             msa_feat:      (batch, N_cluster, N_total, 49)  — DNA positions
                            should be zero-padded by the caller.
             chain_type:    (batch, N_total)  — 0=protein, 1=DNA.
+                           Defaults to all-zeros (all-protein) when omitted.
         """
+        if chain_type is None:
+            chain_type = torch.zeros(
+                target_feat.shape[:2], dtype=torch.long, device=target_feat.device
+            )
         assert target_feat.shape[-1] == JOINT_FEAT_DIM, (
             f"target_feat last dim must be {JOINT_FEAT_DIM}, got {target_feat.shape[-1]}"
         )

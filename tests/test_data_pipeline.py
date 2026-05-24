@@ -10,6 +10,7 @@ from minalphafold.a3m import MASK_ID, MSA_ALPHABET_SIZE, sequence_to_ids
 from minalphafold.data import (
     ProcessedOpenProteinSetDataset,
     TARGET_FEAT_DIM,
+    JOINT_TARGET_FEAT_DIM,
     block_delete_msa,
     build_msa_features,
     build_processed_example,
@@ -393,7 +394,7 @@ def test_dataset_split_and_collate_build_expected_feature_widths(tmp_path):
         training=True,
     )
 
-    assert batch["target_feat"].shape[-1] == TARGET_FEAT_DIM
+    assert batch["target_feat"].shape[-1] == JOINT_TARGET_FEAT_DIM
     assert batch["msa_feat"].shape[-1] == 49
     assert batch["extra_msa_feat"].shape[-1] == 25
     assert batch["template_pair_feat"].shape[-1] == 88

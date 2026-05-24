@@ -588,7 +588,7 @@ class TestAlphaFold2:
 
         N_templ = 2
         N_extra = 8
-        target_feat = torch.randn(B, N_res, 22)
+        target_feat = torch.randn(B, N_res, 27)
         residue_index = torch.arange(N_res).unsqueeze(0).expand(B, -1)
         msa_feat = torch.randn(B, N_seq, N_res, 49)
         extra_msa_feat = torch.randn(B, N_extra, N_res, 25)
@@ -621,7 +621,7 @@ class TestAlphaFold2:
 
         N_templ = 2
         N_extra = 8
-        target_feat = torch.randn(B, N_res, 22)
+        target_feat = torch.randn(B, N_res, 27)
         residue_index = torch.arange(N_res).unsqueeze(0).expand(B, -1)
         msa_feat = torch.randn(B, N_seq, N_res, 49)
         extra_msa_feat = torch.randn(B, N_extra, N_res, 25)

@@ -167,6 +167,8 @@ class AlphaFoldLoss(torch.nn.Module):
     def __init__(self, finetune: bool = False, use_clamped_fape: Optional[float] = None):
         super().__init__()
         self.torsion_angle_loss = TorsionAngleLoss()
+        self.dna_backbone_fape = DnaBackboneFAPE()
+        self.dna_fape_weight = 1.0
         self.plddt_loss = PLDDTLoss(
             filter_by_resolution=True,
             min_resolution=0.1,
@@ -232,6 +234,9 @@ class AlphaFoldLoss(torch.nn.Module):
             return_breakdown: bool = False,
             resolution: Optional[torch.Tensor] = None,
             tm_pred: Optional[torch.Tensor] = None,  # (b, N_res, N_res, n_pae_bins)
+            true_dna_backbone_rot: Optional[torch.Tensor] = None,   # (b, N_res, 3, 3)
+            true_dna_backbone_trans: Optional[torch.Tensor] = None, # (b, N_res, 3)
+            true_dna_frame_mask: Optional[torch.Tensor] = None,     # (b, N_res)
         ):
         loss_terms = self.compute_loss_terms(
             structure_model_prediction=structure_model_prediction,
@@ -263,6 +268,9 @@ class AlphaFoldLoss(torch.nn.Module):
             residue_index=residue_index,
             seq_mask=seq_mask,
             tm_pred=tm_pred,
+            true_dna_backbone_rot=true_dna_backbone_rot,
+            true_dna_backbone_trans=true_dna_backbone_trans,
+            true_dna_frame_mask=true_dna_frame_mask,
         )
         if return_breakdown:
             return loss_terms["loss"], loss_terms
@@ -299,6 +307,9 @@ class AlphaFoldLoss(torch.nn.Module):
             seq_mask: Optional[torch.Tensor] = None,
             resolution: Optional[torch.Tensor] = None,
             tm_pred: Optional[torch.Tensor] = None,
+            true_dna_backbone_rot: Optional[torch.Tensor] = None,
+            true_dna_backbone_trans: Optional[torch.Tensor] = None,
+            true_dna_frame_mask: Optional[torch.Tensor] = None,
         ) -> dict[str, torch.Tensor]:
         pred_all_frames_R = structure_model_prediction["all_frames_R"]  # (batch, N_res, 8, 3, 3)
         pred_all_frames_t = structure_model_prediction["all_frames_t"]  # (batch, N_res, 8, 3)
@@ -428,6 +439,29 @@ class AlphaFoldLoss(torch.nn.Module):
         weighted_plddt_loss = self.confidence_weight * plddt_loss
         loss = structure_loss + weighted_distogram_loss + weighted_msa_loss + weighted_plddt_loss
 
+        # DNA backbone FAPE — only fires when DNA ground-truth frames are supplied.
+        # frame_mask = true_dna_frame_mask (valid C4'/C3'/C1' frame) AND seq_mask.
+        if true_dna_backbone_rot is not None and true_dna_backbone_trans is not None:
+            dna_mask = true_dna_frame_mask if true_dna_frame_mask is not None else (
+                true_dna_backbone_rot.new_ones(true_dna_backbone_rot.shape[:2])
+            )
+            if seq_mask is not None:
+                dna_mask = dna_mask * seq_mask
+            dna_fape = self.dna_backbone_fape(
+                structure_model_prediction["final_rotations"],
+                structure_model_prediction["final_translations"],
+                true_dna_backbone_rot,
+                true_dna_backbone_trans,
+                frame_mask=dna_mask,
+                position_mask=dna_mask,
+                l1_clamp_distance=self.dna_backbone_fape.d_clamp_val,
+            )
+            weighted_dna_fape = self.dna_fape_weight * dna_fape
+            loss = loss + weighted_dna_fape
+        else:
+            dna_fape = loss.new_zeros(loss.shape)
+            weighted_dna_fape = dna_fape
+
         loss_terms = {
             "loss": loss,
             "structure_loss": structure_loss,
@@ -444,6 +478,8 @@ class AlphaFoldLoss(torch.nn.Module):
             "weighted_distogram_loss": weighted_distogram_loss,
             "weighted_msa_loss": weighted_msa_loss,
             "weighted_plddt_loss": weighted_plddt_loss,
+            "dna_fape_loss": dna_fape,
+            "weighted_dna_fape_loss": weighted_dna_fape,
         }
 
         if self.finetune:

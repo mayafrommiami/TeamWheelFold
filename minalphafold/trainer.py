@@ -629,7 +629,7 @@ def learning_rate_at_step(
 
 def model_inputs_from_batch(batch: dict[str, Any], training_config: TrainingConfig) -> dict[str, torch.Tensor | int]:
     """Unpack a collated batch into the kwargs ``AlphaFold2.forward`` expects."""
-    return {
+    inputs: dict[str, Any] = {
         "target_feat": batch["target_feat"],
         "residue_index": batch["residue_index"],
         "msa_feat": batch["msa_feat"],
@@ -646,6 +646,9 @@ def model_inputs_from_batch(batch: dict[str, Any], training_config: TrainingConf
         "n_ensemble": training_config.n_ensemble,
         "detach_rotations": training_config.detach_rotations,
     }
+    if "chain_type" in batch:
+        inputs["chain_type"] = batch["chain_type"]
+    return inputs
 
 
 def collapse_sampled_batch_tensor(
@@ -716,6 +719,9 @@ def loss_inputs_from_batch(batch: dict[str, Any], outputs: dict[str, Any]) -> di
         "res_types": batch["res_types"],
         "residue_index": batch["residue_index"],
         "seq_mask": batch["seq_mask"],
+        "true_dna_backbone_rot": batch.get("true_dna_backbone_rot"),
+        "true_dna_backbone_trans": batch.get("true_dna_backbone_trans"),
+        "true_dna_frame_mask": batch.get("true_dna_frame_mask"),
     }
 
 
